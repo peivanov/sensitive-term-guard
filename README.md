@@ -44,7 +44,7 @@ When using LLMs for document processing, organizations risk exposing:
 
 ```bash
 # Clone and install
-git clone https://github.com/your-org/sensitive-term-guard.git
+git clone https://github.com/peivanov/sensitive-term-guard.git
 cd sensitive-term-guard
 pip install -e .
 
