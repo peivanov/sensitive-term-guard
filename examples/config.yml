@@ -1,0 +1,36 @@
+# Example configuration file for sensitive-term-guard
+
+# Extraction settings
+extraction:
+  min_score: 2.0
+  max_terms: 200
+  methods:
+    - ner
+    - patterns
+    - capitalization
+    - quotes
+  patterns:
+    project_names:
+      - '(?:Project|Operation)\s+([A-Z][a-zA-Z0-9_-]{2,})'
+      - '\b(Project\s+[A-Z][a-zA-Z0-9\s]{2,20})\b'
+    api_services:
+      - '\b([a-zA-Z]+(?:API|Service|Engine))\b'
+    custom_ids:
+      - '\b(CUST-[A-Z0-9]{6})\b'
+      - '\b(PROJ-[0-9]{4})\b'
+
+# LLM settings (optional)
+llm:
+  endpoint: "http://localhost:9099/v1/chat/completions"
+  api_key: "your-api-key"
+  model: "ollama_manifold_pipeline.qwen3:1.7b"
+  temperature: 0.1
+  max_tokens: 300
+  timeout: 30
+
+# Scanner settings
+scanning:
+  redaction_text: "[SENSITIVE]"
+  case_sensitive: false
+  match_type: "contains"  # exact, contains, regex
+  terms_file: "domain-sensitive-terms.txt"
