@@ -7,8 +7,11 @@ using various methods including NER, pattern matching, and optional LLM analysis
 
 import asyncio
 import re
+import json
+import asyncio
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set
+from dataclasses import dataclass
+from typing import List, Dict, Set, Optional, Union, Tuple, Any
 
 try:
     import chromadb
@@ -24,13 +27,15 @@ try:
 except ImportError:
     SENTENCE_TRANSFORMERS_AVAILABLE = False
 
+import spacy
+import nltk
+import aiohttp
+import numpy as np
+import pandas as pd
 from collections import Counter, defaultdict
 
-import nltk
-import spacy
-
 from .logging_config import get_logger
-from .models import ExtractionConfig, LLMConfig, TermScore
+from .models import TermScore, ExtractionConfig, LLMConfig
 
 # Setup logging
 logger = get_logger(__name__)
@@ -65,50 +70,9 @@ class BaseSensitiveTermExtractor:
         else:
             self.embedding_model = None
 
-        # Load spaCy for NER with custom patterns
+        # Load spaCy for NER with enhanced EntityRuler
         try:
             self.nlp = spacy.load("en_core_web_sm")
-
-            # Add custom entity ruler for simple organization-specific patterns
-            ruler = self.nlp.add_pipe("entity_ruler", before="ner")
-
-            patterns = [
-                # Database connection strings
-                {
-                    "label": "DB_CONNECTION",
-                    "pattern": [
-                        {
-                            "TEXT": {
-                                "REGEX": r"^(?:postgresql|mysql|mongodb|redis|clickhouse|oracle|mssql|sqlite)://.*$"
-                            }
-                        }
-                    ],
-                },
-                # Internal domains - organization specific
-                {
-                    "label": "INTERNAL_DOMAIN",
-                    "pattern": [
-                        {
-                            "TEXT": {
-                                "REGEX": r"^[a-zA-Z0-9.-]+\.(?:internal|corp|local|private|intra)$"
-                            }
-                        }
-                    ],
-                },
-                # API Keys
-                {
-                    "label": "API_KEY",
-                    "pattern": [
-                        {
-                            "TEXT": {
-                                "REGEX": r"^[A-Z0-9_]{10,}_(?:KEY|TOKEN|SECRET|API)_[A-Z0-9_]{4,}$"
-                            }
-                        }
-                    ],
-                },
-            ]
-            ruler.add_patterns(patterns)
-
         except OSError:
             logger.warning(
                 "spaCy English model not found. Install with: python -m spacy download en_core_web_sm"
@@ -178,12 +142,119 @@ class BaseSensitiveTermExtractor:
 
         return documents
 
+    def _setup_custom_entity_ruler(self):
+        """Setup advanced EntityRuler with domain-specific patterns"""
+        if not self.nlp:
+            return None
+            
+        # Create EntityRuler with advanced configuration
+        if "entity_ruler" not in self.nlp.pipe_names:
+            ruler = self.nlp.add_pipe("entity_ruler", before="ner", config={
+                "phrase_matcher_attr": "LOWER",  # Case-insensitive matching
+                "validate": True,  # Validate patterns
+                "overwrite_ents": False,  # Don't overwrite existing entities
+            })
+        else:
+            ruler = self.nlp.get_pipe("entity_ruler")
+        
+        # Define sophisticated domain-specific patterns
+        patterns = [
+            # PROJECT NAMES - Using token patterns for flexibility
+            {"label": "PROJECT_NAME", "pattern": [
+                {"LOWER": {"IN": ["project", "initiative", "program", "operation", "codename"]}},
+                {"IS_TITLE": True}
+            ]},
+            {"label": "PROJECT_NAME", "pattern": [
+                {"LOWER": "project"},
+                {"IS_TITLE": True},
+                {"IS_TITLE": True, "OP": "?"}  # Optional second word
+            ]},
+            
+            # TECHNICAL SYSTEMS - Using simpler patterns that work
+            {"label": "TECH_SYSTEM", "pattern": [
+                {"IS_TITLE": True},
+                {"LOWER": {"IN": ["engine", "api", "service", "system", "platform", "dashboard", "monitor", "database", "cache", "vault"]}}
+            ]},
+            {"label": "TECH_SYSTEM", "pattern": [
+                {"IS_TITLE": True},
+                {"LOWER": {"IN": ["cluster", "net", "grid", "hub"]}}
+            ]},
+            
+            # CUSTOMER IDENTIFIERS - Simplified
+            {"label": "CUSTOMER_ID", "pattern": [
+                {"LOWER": "customer"},
+                {"IS_UPPER": True}
+            ]},
+            
+            # ENVIRONMENT NAMES - Using word lists instead of regex
+            {"label": "ENVIRONMENT", "pattern": [
+                {"LOWER": {"IN": ["prod", "staging", "dev", "test", "qa", "uat"]}},
+                {"IS_ALPHA": True, "OP": "?"}
+            ]},
+            
+            # CAMELCASE TECHNICAL TERMS - Simplified approach
+            {"label": "CAMELCASE_TECH", "pattern": [
+                {"IS_TITLE": True},
+                {"IS_TITLE": True}
+            ]},
+            
+            # COMPOUND SYSTEM NAMES
+            {"label": "COMPOUND_SYSTEM", "pattern": [
+                {"IS_TITLE": True},
+                {"TEXT": {"IN": ["-", "_"]}},
+                {"IS_TITLE": True}
+            ]},
+            
+            # SECURITY CLASSIFICATIONS
+            {"label": "SECURITY_CLASS", "pattern": [
+                {"LOWER": {"IN": ["confidential", "restricted", "internal", "proprietary", "classified"]}},
+                {"IS_ALPHA": True, "OP": "*"}
+            ]},
+            
+            # REVENUE MODEL PATTERNS
+            {"label": "REVENUE_MODEL", "pattern": [
+                {"LOWER": "revenue"},
+                {"LOWER": "allocation"},
+                {"IS_TITLE": True}
+            ]},
+        ]
+        
+        # Add phrase patterns for common organizational terms
+        # Use nlp.make_doc() to avoid unnecessary parsing as suggested by spaCy warning
+        # These are generic organizational patterns that can be customized per deployment
+        phrase_patterns = [
+            # Generic infrastructure terms (can be customized via config)
+            {"label": "ORG_SPECIFIC", "pattern": self.nlp.make_doc("Internal Use Only")},
+            {"label": "ORG_SPECIFIC", "pattern": self.nlp.make_doc("Do Not Share")},
+            {"label": "ORG_SPECIFIC", "pattern": self.nlp.make_doc("Confidential Information")},
+            {"label": "ORG_SPECIFIC", "pattern": self.nlp.make_doc("Internal Revenue Allocation Model")},
+            
+            # Note: Add organization-specific terms via configuration file or environment variables
+            # Examples that would be configured per deployment:
+            # - Company-specific product names
+            # - Internal system names  
+            # - Project codenames
+        ]
+        
+        # Add all patterns to ruler
+        ruler.add_patterns(patterns + phrase_patterns)
+        return ruler
+
     def extract_entities_with_ner(self, text: str) -> Dict[str, Set[str]]:
-        """Extract named entities using spaCy NER - focused on organizational terms"""
+        """
+        Extract named entities using enhanced spaCy NER with EntityRuler.
+        
+        This method combines spaCy's built-in NER with custom EntityRuler patterns
+        to provide better detection of organizational, technical, and sensitive terms.
+        """
         entities = defaultdict(set)
 
         if not self.nlp:
             return entities
+
+        # Setup custom EntityRuler if not already done
+        if "entity_ruler" not in self.nlp.pipe_names:
+            self._setup_custom_entity_ruler()
 
         # Process text in chunks to handle long documents
         max_chars = 1000000  # 1MB limit for spaCy
@@ -196,7 +267,7 @@ class BaseSensitiveTermExtractor:
             try:
                 doc = self.nlp(chunk)
 
-                # Extract entities using spaCy NER but filter for organizational relevance
+                # Extract entities using enhanced spaCy NER with EntityRuler
                 for ent in doc.ents:
                     clean_entity = ent.text.strip()
 
@@ -204,67 +275,72 @@ class BaseSensitiveTermExtractor:
                     if len(clean_entity) < 3:
                         continue
 
-                    # Handle custom entity types from our patterns (high priority)
-                    if ent.label_ in ["DB_CONNECTION", "API_KEY", "INTERNAL_DOMAIN"]:
+                    # Handle custom entity types from our EntityRuler patterns (high priority)
+                    if ent.label_ in ['PROJECT_NAME', 'TECH_SYSTEM', 'CUSTOMER_ID', 'ENVIRONMENT', 
+                                     'CAMELCASE_TECH', 'COMPOUND_SYSTEM', 'SECURITY_CLASS', 
+                                     'REVENUE_MODEL', 'ORG_SPECIFIC']:
+                        entities[ent.label_].add(clean_entity)
+                        continue
+
+                    # Legacy custom patterns (for backward compatibility)
+                    elif ent.label_ in ['DB_CONNECTION', 'API_KEY', 'INTERNAL_DOMAIN']:
                         entities[ent.label_].add(clean_entity)
                         continue
 
                     # Focus on spaCy entities that indicate organizational terms
-                    elif ent.label_ == "ORG":
-                        # Organizations - but filter generic ones
-                        if (
-                            not clean_entity.lower() in self.stop_words
-                            and clean_entity
-                            not in {
-                                "Company",
-                                "Corporation",
-                                "Inc",
-                                "LLC",
-                                "Ltd",
-                                "Team",
-                                "Department",
-                                "Group",
-                            }
-                            and len(clean_entity) > 2
-                        ):
-                            entities["ORG"].add(clean_entity)
+                    elif ent.label_ == 'ORG':
+                        # Organizations - but filter out generic ones
+                        if (not clean_entity.lower() in self.stop_words and
+                            clean_entity not in {'Company', 'Corporation', 'Inc', 'LLC', 'Ltd', 'Team', 'Department', 'Group'} and
+                            len(clean_entity) > 2):
+                            entities['ORG'].add(clean_entity)
 
-                    elif ent.label_ == "PRODUCT":
+                    elif ent.label_ == 'PRODUCT':
                         # Products are often organization-specific systems
-                        if len(clean_entity) > 2 and not any(
-                            generic in clean_entity.lower()
-                            for generic in ["product", "service", "solution", "system"]
-                        ):
-                            entities["PRODUCT"].add(clean_entity)
+                        if (len(clean_entity) > 2 and
+                            not any(generic in clean_entity.lower() for generic in ['product', 'service', 'solution', 'system'])):
+                            entities['PRODUCT'].add(clean_entity)
 
-                    elif ent.label_ == "PERSON":
+                    elif ent.label_ == 'PERSON':
                         # People names - but only if they seem relevant (not common names)
-                        if (
-                            len(clean_entity) > 2 and " " in clean_entity
-                        ):  # Full names are more specific
-                            entities["PERSON"].add(clean_entity)
+                        if len(clean_entity) > 2 and ' ' in clean_entity:  # Full names are more specific
+                            entities['PERSON'].add(clean_entity)
 
-                    elif ent.label_ == "EVENT":
+                    elif ent.label_ == 'EVENT':
                         # Events could be conferences, releases, projects
                         if len(clean_entity) > 3 and len(clean_entity.split()) <= 3:
-                            entities["EVENT"].add(clean_entity)
+                            entities['EVENT'].add(clean_entity)
 
-                    elif ent.label_ == "MONEY":
+                    elif ent.label_ == 'MONEY':
                         # Financial information
-                        entities["MONEY"].add(clean_entity)
+                        entities['MONEY'].add(clean_entity)
 
-                    elif ent.label_ == "PERCENT":
+                    elif ent.label_ == 'PERCENT':
                         # Business metrics
-                        entities["PERCENT"].add(clean_entity)
+                        entities['PERCENT'].add(clean_entity)
 
-                # Add regex-based extraction for technical terms that spaCy misses
+                # Add regex-based extraction for technical terms that spaCy/EntityRuler might miss
 
                 # 1. Project/System names (CamelCase compounds)
-                camel_pattern = r"\b([A-Z][a-z]+[A-Z][a-zA-Z]*(?:Engine|API|Service|System|Platform|Hub|Vault|Net|Cluster|Dashboard|Analytics|Insight))\b"
+                camel_pattern = r'\b([A-Z][a-z]+[A-Z][a-zA-Z]*(?:Engine|API|Service|System|Platform|Hub|Vault|Net|Cluster|Dashboard|Analytics|Insight))\b'
                 for match in re.finditer(camel_pattern, chunk):
                     term = match.group(1)
                     if len(term) > 4:
-                        entities["TECH_SYSTEM"].add(term)
+                        entities['TECH_SYSTEM'].add(term)
+
+                # 1b. CamelCase system followed by a TitleCase word (e.g., 'DataVault Prime')
+                tech_phrase_pattern = r"\b([A-Z][a-z]+[A-Z][a-zA-Z]*\s+[A-Z][a-zA-Z]+)\b"
+                for match in re.finditer(tech_phrase_pattern, chunk):
+                    term = match.group(1)
+                    if len(term) > 6:
+                        entities['TECH_SYSTEM_PHRASE'].add(term)
+
+                # 1c. CamelCase system followed by a suffix word (e.g., 'AnalyticsHub API')
+                tech_with_suffix_word = r"\b([A-Z][a-z]+[A-Z][a-zA-Z]*\s+(?:API|Engine|Service|System|Platform|Dashboard|Console|Gateway|Server|Database|Manager|Controller|Monitor|Cluster))\b"
+                for match in re.finditer(tech_with_suffix_word, chunk):
+                    term = match.group(1)
+                    if len(term) > 6:
+                        entities['TECH_SYSTEM_PHRASE'].add(term)
 
                 # 2. Project names with "Project" prefix
                 project_pattern = r"\b(Project\s+[A-Z][a-zA-Z]+)\b"
@@ -312,7 +388,16 @@ class BaseSensitiveTermExtractor:
                 # Technical compound names
                 r"\b([A-Z][a-z]+(?:Processor|Manager|Controller|Handler|Monitor|Dashboard|Analytics|Cluster))\b",
             ],
-            "credentials_and_keys": [
+            'code_names': [
+                r'\b([A-Z][a-z]*[A-Z][a-zA-Z]*(?:Cluster|Net|System|Engine|API|Service|DB))\b',
+                r'\b([A-Z]{2,}[-_][A-Z0-9]{2,})\b',
+                r'\b(Code\s*[Nn]ame\s*:?\s*([A-Z][a-zA-Z0-9\s]{2,15}))\b',
+            ],
+            'api_services': [
+                r'\b([a-zA-Z]+(?:API|Service|Engine|Manager|Controller|Handler|Processor))\b',
+                r'\b([A-Z][a-zA-Z]*(?:DB|Database|Store|Cache|Vault))\b',
+            ],
+            'credentials_and_keys': [
                 # Generic API key patterns
                 r"\b([A-Z]{3,}_(?:DEV|STAGE|STAGING|PROD|PRODUCTION|API|KEY|SECRET|TOKEN)_[A-Z0-9_]+)\b",
                 r"\b([A-Z]{3,}_[A-Z0-9]{4,}_[a-zA-Z0-9]{6,})\b",
@@ -461,7 +546,7 @@ class BaseSensitiveTermExtractor:
                     significance += 20  # Project names are top priority
                 elif "OPERATION_NAME" in extraction_method:
                     significance += 18  # Operation names are very important
-                elif "TECH_SYSTEM" in extraction_method:
+                elif 'TECH_SYSTEM' in extraction_method or 'TECH_SYSTEM_PHRASE' in extraction_method:
                     significance += 15  # Technical systems are highly valuable
                 elif "CUSTOMER_ID" in extraction_method:
                     significance += 14  # Customer identifiers are important
